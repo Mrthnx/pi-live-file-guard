@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="pi-live-file-guard banner" viewBox="0 0 1200 300" width="1200" height="300">
+  <title>pi-live-file-guard</title>
+  <desc>Stale write protection for concurrent Pi sessions.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <style>
+      .ff { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="6" fill="url(#accent)"/>
+
+  <!-- shield + lock mark -->
+  <g transform="translate(96,80)">
+    <path d="M64 0 L120 22 L120 78 C120 120 96 150 64 160 C32 150 8 120 8 78 L8 22 Z"
+          fill="#0b1220" stroke="url(#accent)" stroke-width="4"/>
+    <rect x="44" y="78" width="40" height="34" rx="6" fill="url(#accent)"/>
+    <path d="M52 78 V66 a12 12 0 0 1 24 0 V78" fill="none" stroke="url(#accent)" stroke-width="5"/>
+    <circle cx="64" cy="95" r="5" fill="#0b1220"/>
+  </g>
+
+  <!-- title -->
+  <text class="ff" x="320" y="150" font-size="64" font-weight="700" fill="#f8fafc">pi-live-file-guard</text>
+
+  <!-- subtitle -->
+  <text class="ff" x="324" y="196" font-size="28" font-weight="500" fill="#94a3b8">Stale write protection for concurrent Pi sessions</text>
+
+  <!-- tag pill -->
+  <g transform="translate(324,216)">
+    <rect width="172" height="34" rx="17" fill="#0b1220" stroke="#334155" stroke-width="1.5"/>
+    <text class="ff" x="86" y="23" text-anchor="middle" font-size="16" font-weight="600" fill="#22d3ee">read-hash guarded</text>
+  </g>
+</svg>

@@ -1,6 +1,6 @@
 {
   "name": "pi-live-file-guard",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Prevent stale writes across concurrent Pi sessions using read hashes and a Git common-dir bus.",
   "keywords": [
     "pi-package",
@@ -15,7 +15,7 @@
   "author": "Marthin Lachira",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/Mrthnx/pi-live-file-guard.git"
+    "url": "git+https://github.com/Mrthnx/pi-live-file-guard.git"
   },
   "homepage": "https://github.com/Mrthnx/pi-live-file-guard#readme",
   "bugs": {
@@ -23,13 +23,15 @@
   },
   "files": [
     "extensions",
+    "media",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
       "./extensions"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/Mrthnx/pi-live-file-guard/main/media/banner.svg"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
