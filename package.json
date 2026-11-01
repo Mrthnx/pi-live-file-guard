@@ -1,6 +1,6 @@
 {
   "name": "pi-live-file-guard",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Prevent stale writes across concurrent Pi sessions using read hashes and a Git common-dir bus.",
   "keywords": [
     "pi-package",
