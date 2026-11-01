@@ -19,12 +19,29 @@
  *   - A filesystem watcher (+ polling fallback) on the bus delivers live
  *     notifications to sessions that had the changed file open.
  *
+ * How delegation is handled (lineage trust):
+ *   - A parent Pi session delegates work to subagent sessions. Those subagents
+ *     are separate `pi` processes with their own session id, but they inherit
+ *     the parent's environment, so the parent can publish its delegation
+ *     lineage through `LIVE_FILE_GUARD_LINEAGE_CHAIN` and every child (and
+ *     grandchild) inherits it.
+ *   - A change published by a session inside my own lineage (my descendant or
+ *     my ancestor) is trusted: it never blocks my write and never forces a
+ *     re-read. It produces a single informational notice per file.
+ *   - A change published by a session outside my lineage (an independent root
+ *     session, or a sibling subagent) still blocks exactly as before.
+ *
  * Configuration (env):
  *   LIVE_FILE_GUARD_STRICT=1   Block writes when the file changed, even if the
  *                              change was not published by a Pi session (i.e. a
  *                              human/IDE edit). Also requires a prior `read`.
  *   LIVE_FILE_GUARD_TTL_MS     Soft-claim TTL in ms (default 120000).
  *   LIVE_FILE_GUARD_OFF=1      Disable the guard entirely.
+ *   LIVE_FILE_GUARD_LINEAGE=off Disable lineage trust: every other session
+ *                              blocks again (default: trust enabled).
+ *   LIVE_FILE_GUARD_LINEAGE_CHAIN
+ *                              Written by the extension itself (not by humans):
+ *                              the delegation chain a child session inherits.
  *
  * Commands:
  *   /lfg status             Show claims, watched files, and last edits.
@@ -64,6 +81,8 @@ const SCHEMA = "lfg" as const;
 const STRICT = process.env.LIVE_FILE_GUARD_STRICT === "1";
 const DISABLED = process.env.LIVE_FILE_GUARD_OFF === "1";
 const TTL_MS = Number(process.env.LIVE_FILE_GUARD_TTL_MS) || TTL_DEFAULT_MS;
+const LINEAGE_CHAIN_ENV = "LIVE_FILE_GUARD_LINEAGE_CHAIN";
+const LINEAGE_TRUST_ENABLED = process.env.LIVE_FILE_GUARD_LINEAGE !== "off";
 
 // ─── Bus record types ────────────────────────────────────────────────────────
 
@@ -75,6 +94,8 @@ interface SessionRecord {
   commonDir: string;
   pid: number;
   lastSeen: number;
+  /** Delegation ancestors of this session, root first, excluding itself. */
+  lineage?: string[];
 }
 interface ReadRecord {
   schema: "lfg.read/v1";
@@ -101,6 +122,8 @@ interface ChangeRecord {
   tool: string;
   toolCallId: string;
   changedAt: number;
+  /** Delegation ancestors of the changing session, root first, excluding it. */
+  lineage?: string[];
 }
 type BusRecord = SessionRecord | ReadRecord | ClaimRecord | ChangeRecord;
 
@@ -174,6 +197,11 @@ class GuardState {
   busDir = "";
   enabled = false;
 
+  /** Delegation ancestors of this session, root first, excluding this session. */
+  ancestors: string[] = [];
+  /** `${path}|${sessionId}` pairs already announced as in-lineage changes. */
+  lineageNotified = new Set<string>();
+
   readonly reads = new Map<string, ReadEntry>(); // repo-rel path -> last read
   readonly lastChange = new Map<string, ChangeRecord>(); // repo-rel path -> last published change (any session)
   readonly claims = new Map<string, ClaimRecord>(); // repo-rel path -> my active claim
@@ -239,6 +267,41 @@ function normalizePath(rawPath: unknown): { abs: string; rel: string } | null {
   return { abs, rel };
 }
 
+// ─── Delegation lineage ──────────────────────────────────────────────────────
+
+/** Parse an inherited ancestor chain ("root,parent") into session ids. */
+function parseAncestorChain(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
+
+/**
+ * Read my delegation ancestors from the environment and publish the chain my
+ * own children inherit. A child process inherits the parent's environment
+ * (the parent spawns it), so the chain travels down the delegation tree:
+ * root writes "R", child reads "R" and writes "R,C", grandchild reads "R,C".
+ */
+function adoptLineage(sessionId: string): void {
+  S.ancestors = parseAncestorChain(process.env[LINEAGE_CHAIN_ENV]);
+  process.env[LINEAGE_CHAIN_ENV] = [...S.ancestors, sessionId].join(",");
+}
+
+/** How another session relates to me in the delegation tree. */
+type Relation = "self" | "descendant" | "ancestor" | "foreign";
+
+function relationTo(other: { sessionId: string; lineage?: string[] }): Relation {
+  if (other.sessionId === S.sessionId) return "self";
+  if (!LINEAGE_TRUST_ENABLED) return "foreign";
+  // The other session descends from me: my id is in its ancestor chain.
+  if (Array.isArray(other.lineage) && other.lineage.includes(S.sessionId)) return "descendant";
+  // The other session is one of my ancestors: its id is in my ancestor chain.
+  if (S.ancestors.includes(other.sessionId)) return "ancestor";
+  return "foreign";
+}
+
 // ─── Bus setup ───────────────────────────────────────────────────────────────
 
 function initBus(): boolean {
@@ -266,16 +329,25 @@ function writeHeartbeat(): void {
     commonDir: S.commonDir,
     pid: process.pid,
     lastSeen: now(),
+    lineage: [...S.ancestors],
   };
   appendLine(join(S.busDir, "sessions.jsonl"), rec);
 }
 
 // ─── Stale check (PRD §12.1) ─────────────────────────────────────────────────
 
-interface StaleResult {
+interface BlockedWrite {
   block: true;
   reason: string;
 }
+interface TrustedWrite {
+  block: false;
+  /** Hash of the file right now; the caller refreshes its read baseline with it. */
+  actual: string;
+  relation: Relation;
+  changer: ChangeRecord;
+}
+type StaleResult = BlockedWrite | TrustedWrite;
 
 function staleCheck(rel: string, abs: string): StaleResult | null {
   const actual = hashFile(abs);
@@ -306,6 +378,12 @@ function staleCheck(rel: string, abs: string): StaleResult | null {
 
   // (7) Another Pi session changed it and the file matches that published change.
   if (ultimo && ultimo.sessionId !== S.sessionId && actual === ultimo.after) {
+    const relation = relationTo(ultimo);
+    // (7a) The change comes from my own delegation lineage (my subagent or my
+    // parent session). It is trusted: no block, no forced re-read.
+    if (relation === "descendant" || relation === "ancestor") {
+      return { block: false, actual, relation, changer: ultimo };
+    }
     return {
       block: true,
       reason:
@@ -330,6 +408,29 @@ function staleCheck(rel: string, abs: string): StaleResult | null {
   return null; // permissive: allow human edits
 }
 
+/**
+ * Announce an in-lineage change once per (path, changing session). The notice
+ * is informational: it says the file moved under us without demanding a
+ * re-read, because the change comes from a session we delegated to (or from
+ * the session that delegated to us).
+ */
+function notifyLineageChange(
+  rel: string,
+  relation: Relation,
+  changer: ChangeRecord,
+  notify: (msg: string, type?: "info" | "warning" | "error") => void,
+): void {
+  const key = `${rel}|${changer.sessionId}`;
+  if (S.lineageNotified.has(key)) return;
+  S.lineageNotified.add(key);
+  const who = relation === "descendant" ? "tu subagente" : "tu sesión padre";
+  notify(
+    `live-file-guard: "${rel}" lo modificó ${who} ${changer.sessionId.slice(0, 8)} (${changer.tool}). ` +
+      `Tu copia en contexto puede estar desactualizada; no hace falta re-leer para escribir.`,
+    "info",
+  );
+}
+
 // ─── Change publication + read registry update ───────────────────────────────
 
 function publishChange(rel: string, abs: string, before: string, tool: string, toolCallId: string): void {
@@ -344,6 +445,7 @@ function publishChange(rel: string, abs: string, before: string, tool: string, t
     tool,
     toolCallId,
     changedAt: now(),
+    lineage: [...S.ancestors],
   };
   appendLine(S.changesFile, rec);
   S.lastChange.set(rel, rec);
@@ -352,7 +454,7 @@ function publishChange(rel: string, abs: string, before: string, tool: string, t
 
 // ─── Watcher: drain new change lines and notify ──────────────────────────────
 
-function drainChanges(notify: (msg: string) => void): void {
+function drainChanges(notify: (msg: string, type?: "info" | "warning" | "error") => void): void {
   let st: ReturnType<typeof statSync>;
   try {
     st = statSync(S.changesFile);
@@ -391,15 +493,22 @@ function drainChanges(notify: (msg: string) => void): void {
     // Notify if another session changed a file we have read.
     if (rec.sessionId === S.sessionId) continue;
     if (S.reads.has(rec.path)) {
+      const relation = relationTo(rec);
+      if (relation === "descendant" || relation === "ancestor") {
+        // Our own delegation lineage: informational only, no re-read demanded.
+        notifyLineageChange(rec.path, relation, rec, notify);
+        continue;
+      }
       notify(
         `⚠ live-file-guard: "${rec.path}" fue modificado por la sesión ${rec.sessionId.slice(0, 8)} ` +
           `(${rec.tool}). Re-leé antes de editar.`,
+        "warning",
       );
     }
   }
 }
 
-function startWatcher(notify: (msg: string) => void): void {
+function startWatcher(notify: (msg: string, type?: "info" | "warning" | "error") => void): void {
   // Seed offset at current end so we don't replay history as notifications.
   try {
     S.changeOffset = statSync(S.changesFile).size;
@@ -490,6 +599,10 @@ function cmdStatus(notify: (msg: string, type?: "info" | "warning" | "error") =>
   lines.push(`repo: ${S.gitRoot}`);
   lines.push(`bus:  ${S.busDir}`);
   lines.push(`modo: ${STRICT ? "estricto" : "permisivo"} · TTL ${TTL_MS}ms`);
+  lines.push(
+    `linaje: ${LINEAGE_TRUST_ENABLED ? "confiable" : "deshabilitado (off)"} · ` +
+      `ancestros: ${S.ancestors.length > 0 ? S.ancestors.map((id) => id.slice(0, 8)).join(" → ") : "(ninguno, soy raíz)"}`,
+  );
   lines.push("");
 
   // Claims (mine + siblings, from bus)
@@ -520,7 +633,9 @@ function cmdStatus(notify: (msg: string, type?: "info" | "warning" | "error") =>
   lines.push(`Última edición por archivo (${S.lastChange.size}):`);
   for (const [p, c] of S.lastChange) {
     const mine = c.sessionId === S.sessionId ? " (yo)" : "";
-    lines.push(`  ${p} → ${short(c.after)} por ${c.sessionId.slice(0, 8)}${mine} (${c.tool})`);
+    const relation = relationTo(c);
+    const kin = relation === "descendant" ? " (mi linaje)" : relation === "ancestor" ? " (mi ancestro)" : "";
+    lines.push(`  ${p} → ${short(c.after)} por ${c.sessionId.slice(0, 8)}${mine}${kin} (${c.tool})`);
   }
 
   notify(lines.join("\n"), "info");
@@ -569,6 +684,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     S.sessionId = ctx.sessionManager.getSessionId();
     S.cwd = realpathSafe(ctx.cwd);
+    // Adopt the delegation chain inherited from the parent session and publish
+    // my own chain for the children I may spawn.
+    adoptLineage(S.sessionId);
 
     const id = await resolveIdentity(pi.exec, S.cwd);
     if (!id) {
@@ -592,8 +710,8 @@ export default function (pi: ExtensionAPI) {
     }
     S.enabled = true;
 
-    const notify = (msg: string) => {
-      if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+    const notify = (msg: string, type: "info" | "warning" | "error" = "warning") => {
+      if (ctx.hasUI) ctx.ui.notify(msg, type);
     };
 
     writeHeartbeat();
@@ -645,8 +763,16 @@ export default function (pi: ExtensionAPI) {
 
       const stale = staleCheck(norm.rel, norm.abs);
       if (stale) {
-        if (ctx.hasUI) ctx.ui.notify(stale.reason, "warning");
-        return { block: true, reason: stale.reason };
+        if (stale.block) {
+          if (ctx.hasUI) ctx.ui.notify(stale.reason, "warning");
+          return { block: true, reason: stale.reason };
+        }
+        // Trusted in-lineage change (my subagent or my parent session): allow
+        // the write, announce it once, and refresh my read baseline.
+        notifyLineageChange(norm.rel, stale.relation, stale.changer, (msg, type) => {
+          if (ctx.hasUI) ctx.ui.notify(msg, type);
+        });
+        S.reads.set(norm.rel, { hash: stale.actual, readAt: now() });
       }
 
       // Soft claim for visibility (best-effort).
